@@ -137,6 +137,24 @@ class ItemInterface(graphene.Interface):
     def resolve_name_with_prefix(root, info, prefix):
         return getattr(root, 'gql_name_with_prefix')
 
+    @gql_optimizer.resolver_hints(
+        annotate={
+            'gql_children_count': Count('children')
+        }
+    )
+    def resolve_children_count(root, info):
+        return getattr(root, 'gql_children_count')
+
+    @gql_optimizer.resolver_hints(
+        annotate=lambda info, prefix: {
+            'gql_name_with_prefix': Concat(
+                Value(prefix), Value(' '), F('name'), output_field=CharField()
+            )
+        }
+    )
+    def resolve_name_with_prefix(root, info, prefix):
+        return getattr(root, 'gql_name_with_prefix')
+
 
 class BaseItemType(OptimizedDjangoObjectType):
     title = gql_optimizer.field(
