@@ -13,14 +13,14 @@ def read(fname):
 
 
 setup(
-    name='graphene-django-optimizer',
+    name='graphene-django-optimizer-patch',
     version='0.8.0',
-    author='Tomás Fox',
-    author_email='tomas.c.fox@gmail.com',
+    author='Gabriel Sebag',
+    author_email='hello@gabrielsebag.com',
     description='Optimize database access inside graphene queries.',
     license='MIT',
     keywords='graphene django optimizer optimize graphql query prefetch select related',
-    url='https://github.com/tfoxy/graphene-django-optimizer',
+    url='https://github.com/gabrielsebag/graphene-django-optimizer',
     packages=['graphene_django_optimizer'],
     setup_requires=pytest_runner,
     long_description=read('README.md'),
