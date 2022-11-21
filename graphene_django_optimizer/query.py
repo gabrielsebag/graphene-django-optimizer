@@ -359,18 +359,19 @@ class QueryOptimizerStore():
                     self.select_list.append(name + LOOKUP_SEP + select)
             else:
                 self.select_list.append(name)
-        for prefetch in store.prefetch_list:
-            if isinstance(prefetch, Prefetch):
-                prefetch.add_prefix(name)
-            else:
-                prefetch = name + LOOKUP_SEP + prefetch
-            self.prefetch_list.append(prefetch)
-        if self.only_list is not None:
-            if store.only_list is None:
-                self.abort_only_optimization()
-            else:
-                for only in store.only_list:
-                    self.only_list.append(name + LOOKUP_SEP + only)
+
+            for prefetch in store.prefetch_list:
+                if isinstance(prefetch, Prefetch):
+                    prefetch.add_prefix(name)
+                else:
+                    prefetch = name + LOOKUP_SEP + prefetch
+                self.prefetch_list.append(prefetch)
+            if self.only_list is not None:
+                if store.only_list is None:
+                    self.abort_only_optimization()
+                else:
+                    for only in store.only_list:
+                        self.only_list.append(name + LOOKUP_SEP + only)
 
     def prefetch_related(self, name, store, queryset):
         if store.select_list or store.only_list:
