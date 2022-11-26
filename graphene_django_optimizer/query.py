@@ -1,4 +1,5 @@
 import functools
+from collections import defaultdict
 
 from django.core.exceptions import FieldDoesNotExist
 from django.db.models import ForeignKey, Prefetch
@@ -13,6 +14,9 @@ from graphql.execution.base import (
     get_field_def,
 )
 from graphql.language.ast import (
+    Field,
+    Name,
+    SelectionSet,
     FragmentSpread,
     InlineFragment,
     Variable,
@@ -59,13 +63,122 @@ class QueryOptimizer(object):
         field_def = get_field_def(info.schema, info.parent_type, info.field_name)
         store = self._optimize_gql_selections(
             self._get_type(field_def),
-            info.field_asts[0],
+            self._transform_fields(
+                field_asts=info.field_asts
+            )[0],
             # info.parent_type,
         )
+
         if self.parent_id_field:
             store.only(self.parent_id_field)
 
         return store.optimize_queryset(queryset)
+
+    def _transform_fields(self, field_asts):
+        transformed_fields = []
+
+        for field_ast in field_asts:
+            if isinstance(field_ast, InlineFragment):
+                info = self.root_info
+
+                field_type = self._get_type(get_field_def(
+                    info.schema,
+                    info.parent_type,
+                    info.field_name
+                ))
+                graphql_type = info.schema.get_graphql_type(field_type.graphene_type)
+                possible_types = self._get_possible_types(graphql_type)
+
+                fragment_type_name = field_ast.type_condition.name.value
+                fragment_type = info.schema.get_type(fragment_type_name)
+                fragment_possible_types = self._get_possible_types(fragment_type)
+
+                for fragment_possible_type in fragment_possible_types:
+                    fragment_model = fragment_possible_type.graphene_type._meta.model
+                    parent_model = self._get_base_model(possible_types)
+                    if not parent_model:
+                        continue
+                    path_from_parent = _get_path_from_parent(
+                        fragment_model._meta, parent_model
+                    )
+                    select_related_name = LOOKUP_SEP.join(
+                        p.join_field.name for p in path_from_parent
+                    )
+                    if not select_related_name:
+                        continue
+
+                    transformed_fields.append(Field(
+                        name=Name(select_related_name),
+                        arguments=[],
+                        directives=field_ast.directives,
+                        selection_set=field_ast.selection_set
+                    ))
+            elif isinstance(field_ast, FragmentSpread):
+                name = field_ast.name.value
+                fragment = self.root_info.fragments[name]
+                transformed_fields += self._transform_fields(
+                    field_asts=fragment.selection_set.selections
+                )
+            else:
+                transformed_fields.append(field_ast)
+
+        for field_ast in transformed_fields:
+            selection_set = field_ast.selection_set
+
+            if selection_set:
+                subfield_asts = defaultdict(list)
+                for subfield_ast in self._transform_fields(
+                    field_asts=selection_set.selections
+                ):
+                    subfield_asts[subfield_ast.name.value].append(subfield_ast)
+
+                transformed_selections = []
+                for key, value in subfield_asts.items():
+                    if len(value) > 0:
+                        f = Field(
+                            name=Name(key),
+                            arguments=[],
+                            directives=[],
+                            selection_set=[]
+                        )
+                        for v in value:
+                            f = self._merge_fields(f, v)
+                        transformed_selections.append(f)
+
+                field_ast.selection_set = SelectionSet(selections=transformed_selections)
+
+        return transformed_fields
+
+    def _merge_fields(self, left, right):
+        name = right.name
+
+        alias = right.alias
+        if right.alias is not None:
+            left.alias = right.alias
+
+        arguments = left.arguments + right.arguments
+
+        directives = left.directives + right.directives
+
+        selections = []
+        if left.selection_set:
+            selections += left.selection_set.selections
+        if right.selection_set:
+            selections += right.selection_set.selections
+
+        selection_set = (
+            SelectionSet(selections=selections)
+            if len(selections) > 0
+            else None
+        )
+
+        return Field(
+            name=name,
+            alias=alias,
+            arguments=arguments,
+            directives=directives,
+            selection_set=selection_set
+        )
 
     def _get_type(self, field_def):
         a_type = field_def.type
@@ -86,38 +199,6 @@ class QueryOptimizer(object):
                 return model
         return None
 
-    def handle_inline_fragment(self, selection, schema, possible_types, store):
-        fragment_type_name = selection.type_condition.name.value
-        fragment_type = schema.get_type(fragment_type_name)
-        fragment_possible_types = self._get_possible_types(fragment_type)
-        for fragment_possible_type in fragment_possible_types:
-            fragment_model = fragment_possible_type.graphene_type._meta.model
-            parent_model = self._get_base_model(possible_types)
-            if not parent_model:
-                continue
-            path_from_parent = _get_path_from_parent(
-                fragment_model._meta, parent_model)
-            select_related_name = LOOKUP_SEP.join(
-                p.join_field.name for p in path_from_parent)
-            if not select_related_name:
-                continue
-            fragment_store = self._optimize_gql_selections(
-                fragment_possible_type,
-                selection,
-                # parent_type,
-            )
-            store.select_related(select_related_name, fragment_store)
-        return store
-
-    def handle_fragment_spread(self, store, name, field_type):
-        fragment = self.root_info.fragments[name]
-        fragment_store = self._optimize_gql_selections(
-            field_type,
-            fragment,
-            # parent_type,
-        )
-        store.append(fragment_store)
-
     def _optimize_gql_selections(self, field_type, field_ast):
         store = QueryOptimizerStore(
             disable_abort_only=self.disable_abort_only,
@@ -130,47 +211,41 @@ class QueryOptimizer(object):
         schema = self.root_info.schema
         graphql_type = schema.get_graphql_type(field_type.graphene_type)
         possible_types = self._get_possible_types(graphql_type)
-        for selection in selection_set.selections:
-            if isinstance(selection, InlineFragment):
-                self.handle_inline_fragment(
-                    selection, schema, possible_types, store)
-            else:
-                name = selection.name.value
-                if isinstance(selection, FragmentSpread):
-                    self.handle_fragment_spread(store, name, field_type)
-                else:
-                    for possible_type in possible_types:
-                        selection_field_def = possible_type.fields.get(name)
-                        if not selection_field_def:
-                            continue
 
-                        graphene_type = possible_type.graphene_type
-                        # Check if graphene type is a relay connection or a relay edge
-                        if hasattr(graphene_type._meta, 'node') or (
-                            hasattr(graphene_type, 'cursor')
-                            and hasattr(graphene_type, 'node')
-                        ):
-                            relay_store = self._optimize_gql_selections(
-                                self._get_type(selection_field_def),
+        for selection in selection_set.selections:
+            name = selection.name.value
+            for possible_type in possible_types:
+                selection_field_def = possible_type.fields.get(name)
+                if not selection_field_def:
+                    continue
+
+                graphene_type = possible_type.graphene_type
+                # Check if graphene type is a relay connection or a relay edge
+                if hasattr(graphene_type._meta, 'node') or (
+                    hasattr(graphene_type, 'cursor')
+                    and hasattr(graphene_type, 'node')
+                ):
+                    relay_store = self._optimize_gql_selections(
+                        self._get_type(selection_field_def),
+                        selection,
+                    )
+                    store.append(relay_store)
+                    try:
+                        from django.db.models import DEFERRED  # noqa: F401
+                    except ImportError:
+                        store.abort_only_optimization()
+                else:
+                    model = getattr(graphene_type._meta, 'model', None)
+                    if model and name not in optimized_fields_by_model:
+                        field_model = optimized_fields_by_model[name] = model
+                        if field_model == model:
+                            self._optimize_field(
+                                store,
+                                model,
                                 selection,
+                                selection_field_def,
+                                possible_type,
                             )
-                            store.append(relay_store)
-                            try:
-                                from django.db.models import DEFERRED  # noqa: F401
-                            except ImportError:
-                                store.abort_only_optimization()
-                        else:
-                            model = getattr(graphene_type._meta, 'model', None)
-                            if model and name not in optimized_fields_by_model:
-                                field_model = optimized_fields_by_model[name] = model
-                                if field_model == model:
-                                    self._optimize_field(
-                                        store,
-                                        model,
-                                        selection,
-                                        selection_field_def,
-                                        possible_type,
-                                    )
         return store
 
     def _optimize_field(self, store, model, selection, field_def, parent_type):
@@ -186,36 +261,43 @@ class QueryOptimizer(object):
         name = self._get_name_from_resolver(field_def.resolver)
         if not name:
             return False
+
         model_field = self._get_model_field_from_name(model, name)
         if not model_field:
             return False
+
         if self._is_foreign_key_id(model_field, name):
             store.only(name)
             return True
-        if model_field.many_to_one or model_field.one_to_one:
-            field_store = self._optimize_gql_selections(
-                self._get_type(field_def),
-                selection,
-                # parent_type,
-            )
-            store.select_related(name, field_store, model_field=model_field)
-            return True
-        if model_field.one_to_many or model_field.many_to_many:
-            field_store = self._optimize_gql_selections(
-                self._get_type(field_def),
-                selection,
-                # parent_type,
-            )
 
+        field_store = self._optimize_gql_selections(
+            self._get_type(field_def),
+            selection,
+            # parent_type,
+        )
+        if model_field.many_to_one or model_field.one_to_one:
+            if field_store.annotate_dict:
+                store.only(model_field.attname)
+                store.prefetch_related(name, field_store, model_field)
+            else:
+                store.select_related(name, field_store, model_field)
+
+            return True
+
+        if model_field.one_to_many or model_field.many_to_many:
             if isinstance(model_field, ManyToOneRel):
                 field_store.only(model_field.field.name)
+            else:
+                store.only(model_field.field.name)
 
-            related_queryset = model_field.related_model.objects.all()
-            store.prefetch_related(name, field_store, related_queryset)
+            store.prefetch_related(name, field_store, model_field)
+
             return True
+
         if not model_field.is_relation:
             store.only(name)
             return True
+
         return False
 
     def _get_optimization_hints(self, resolver):
@@ -282,6 +364,7 @@ class QueryOptimizer(object):
             name_fn = optimization_hints.model_field
             if name_fn:
                 return name_fn()
+
         if self._is_resolver_for_id_field(resolver):
             return 'id'
         elif isinstance(resolver, functools.partial):
@@ -349,32 +432,32 @@ class QueryOptimizerStore():
         self.only_list = []
         self.disable_abort_only = disable_abort_only
 
-    def select_related(self, name, store, model_field=None):
-        if store.annotate_dict:
-            self.only(model_field.attname)
-            self.prefetch_related(name, store, model_field.related_model.objects.all())
+    def select_related(self, name, store, model_field):
+        if store.select_list:
+            for select in store.select_list:
+                self.select_list.append(name + LOOKUP_SEP + select)
         else:
-            if store.select_list:
-                for select in store.select_list:
-                    self.select_list.append(name + LOOKUP_SEP + select)
+            self.select_list.append(name)
+
+        for prefetch in store.prefetch_list:
+            if isinstance(prefetch, Prefetch):
+                prefetch.add_prefix(name)
             else:
-                self.select_list.append(name)
+                prefetch = name + LOOKUP_SEP + prefetch
+            self.prefetch_list.append(prefetch)
 
-            for prefetch in store.prefetch_list:
-                if isinstance(prefetch, Prefetch):
-                    prefetch.add_prefix(name)
-                else:
-                    prefetch = name + LOOKUP_SEP + prefetch
-                self.prefetch_list.append(prefetch)
-            if self.only_list is not None:
-                if store.only_list is None:
-                    self.abort_only_optimization()
-                else:
-                    for only in store.only_list:
-                        self.only_list.append(name + LOOKUP_SEP + only)
+        if self.only_list is not None:
+            if store.only_list is None:
+                self.abort_only_optimization()
+            else:
+                self.only_list.append(name)
+                for only in store.only_list:
+                    self.only_list.append(name + LOOKUP_SEP + only)
 
-    def prefetch_related(self, name, store, queryset):
-        if store.select_list or store.only_list:
+    def prefetch_related(self, name, store, model_field):
+        queryset = model_field.related_model.objects.all()
+
+        if store.select_list or store.only_list or store.annotate_dict:
             queryset = store.optimize_queryset(queryset)
             self.prefetch_list.append(Prefetch(name, queryset=queryset))
         elif store.prefetch_list:

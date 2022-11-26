@@ -545,11 +545,17 @@ def test_should_prefetch_related_when_select_related_is_annotated():
     info = create_resolve_info(schema, '''
         query {
             items(name: "foo") {
-                id
-                parent {
-                    id
-                    childrenCount
-                }
+                ...I
+            }
+        }
+        fragment J on ItemType {
+            id
+        }
+        fragment I on ItemType {
+            ...J
+            parent{
+                ...J
+                childrenCount
             }
         }
     ''')
